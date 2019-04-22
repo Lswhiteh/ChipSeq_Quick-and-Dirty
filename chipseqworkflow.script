@@ -1,0 +1,71 @@
+#!/bin/bash
+#PBS -k o
+#PBS -l nodes=1:ppn=16,walltime=01:00:00,vmem=16gb
+#PBS -M lswhiteh@iu.edu
+#PBS -m abe
+#PBS -N chipseqanalysis 
+#PBS -j oe
+
+module load anaconda
+source activate chipseq
+
+for FILE in ~/chipseq/reads/*.fastq
+do
+	#Trim and quality threshold
+	scythe -a <barcodes here> -o trimmed_${FILE} $FILE 
+	sickle se -f trimmed_${FILE} -t illumina -o sickled_${file} -q 30 -l 45
+done
+
+# Get Human aligned and unaligned, convert to bam
+bowtie2 -q -x ~/chipseq/reference_genomes/homosapiens/GCA_000001405.15_GRCh38_full_analysis_set.fna.bowtie_index -U ~/chipseq/reads/sickled* -S ~/chipseq/homosapiensalignments.sam
+
+samtools view -bS ~/chipseq/homosapiensalignments.sam > ~/chipseq/homosapiensalignments.bam
+
+#Filter based on unmapped reads. This needs to be changed to -f 12 if paired reads
+samtools view -b -f 4 -F 256 ~/chipseq/homosapiensalignments.bam > ~/chipseq/hsunmapped.bam
+
+#Return to fq to realign to vervet
+samtools bam2fq ~/chipseq/hsunmapped.bam ~/chipseq/hsunmapped.fq
+
+# Get Vervet aligned and unaligned, convert to bam
+bowtie2 -q -x ~/chipseq/reference_genomes/vervet/vervet_1.1_genomic -U ~/chipseq/hsunmapped -S ~/chipseq/vervetalignments.sam
+
+samtools view -bS ~/chipseq/vervetalignments.sam > ~/chipseq/vervetalignments.bam
+
+#Get reads that dont align to either
+samtools view -b -f 4 -F 256 ~/chipseq/vervetalignments.bam > ~/chipseq/unmapped.bam
+
+#Merge bamfiles
+#Convert bam file to fastq for SV40 alignment
+samtools bam2fq ~/chipseq/unmapped.bam ~/chipseq/unmapped.fq
+
+#Align unmapped reads to SV40 genome
+bowtie2 -q -x ~/chipseq/reference_genomes/sv40/sv40index -U ~/chipseq/unmapped.bam -S ~/chipseq/sv40aligned.sam
+
+#SAM -> BAM, sort
+samtools view -bS ~/chipseq/sv40aligned.sam > ~/chipseq/sv40aligned.bam
+samtools sort ~/chipseq/sv40aligned.bam > ~/chipseq/sv40alignedsorted.bam
+
+#Mark duplicates
+picard MarkDuplicates INPUT=~/chipseq/sv40alignedsorted.bam OUTPUT=~/chipseq/sv40aligneddupesmarked.bam ASSUME_SORTED=true 
+samtools index ~/chipseq/sv40aligneddupesmarked.bam
+
+#Get rid of dupes
+samtools view -b -F 0x400 ~/chipseq/sv40aligneddupesmarked.bam > ~/chipseq/sv40aligneddupesremoved.bam
+samtools index ~/chipseq/sv40aligneddupesremoved.bam
+
+#SHOULDN'T NEED BECAUSE DEEPTOOLS HANDLES IT, BUT KEEPING HERE JUST IN CASE
+#Filter out by size, between 100 and 150
+#samtools view -h ~/chipseq/sv40aligneddupesremoved.bam | awk 'length($10) > 99 && length($10) < 151 ||  ~ /^@/' | samtools view -bS - > ~/chipseq/sizefiltered.bam
+
+
+#Normalize to 1x coverage
+bamCompare --b ~/chipseq/sv40aligneddupesremoved.bam -o finaloutput.bg \
+	--effectiveGenomeSize 5243
+	--normalizeUsing RPGC
+	--minFragmentLength 100
+	--maxFragmentLength 150 
+	--outFileFormat  bedgraph 
+
+
+
